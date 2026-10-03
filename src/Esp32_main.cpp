@@ -26,8 +26,11 @@
  *   05 IMG_END      u8 checksum
  *   06 END_SYNC
  *
+ *   07 GET_STORAGE (no payload)
+ *
  * ESP -> App:
  *   80 refType status
+ *   81 u32 totalBytes, u32 usedBytes   (reply to 07, also sent after END_SYNC)
  *
  * UART to RP2040:
  *   I\tw\th\tlen\n + raw image + checksum
@@ -194,6 +197,25 @@ void sendStatus(uint8_t refType, uint8_t status) {
     packet[2] = status;
 
     txCharacteristic->setValue(packet, sizeof(packet));
+    txCharacteristic->notify();
+}
+
+// ============================================================
+// Storage report (ESP -> App): [0x81][total u32 LE][used u32 LE]
+// ============================================================
+
+void sendStorage() {
+
+    if (!txCharacteristic || !bleConnected)
+        return;
+
+    uint8_t p[9];
+
+    p[0] = 0x81;
+    putU32(p + 1, (uint32_t)LittleFS.totalBytes());
+    putU32(p + 5, (uint32_t)LittleFS.usedBytes());
+
+    txCharacteristic->setValue(p, sizeof(p));
     txCharacteristic->notify();
 }
 
@@ -1047,6 +1069,7 @@ void endSync() {
     currentBack = false;
 
     sendStatus(0x06, 0);
+    sendStorage();
 
     Serial.printf(
         "SYNC COMPLETE: %u cards\n",
@@ -1117,6 +1140,11 @@ void handleBLEPacket(
             }
 
             endSync();
+            break;
+
+        case 0x07: // GET_STORAGE
+
+            sendStorage();
             break;
 
         default:
