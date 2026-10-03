@@ -73,8 +73,8 @@ const int HEADER_H = 32;
 // Image buffer
 // ============================================================
 
-#define IMG_MAX_W 320
-#define IMG_MAX_H 240
+#define IMG_MAX_W 640
+#define IMG_MAX_H 480
 
 static uint8_t imgBuf[
     (IMG_MAX_W / 8) * IMG_MAX_H

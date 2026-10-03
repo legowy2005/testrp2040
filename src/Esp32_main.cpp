@@ -86,7 +86,9 @@ HardwareSerial RPSerial(1);
 // ============================================================
 
 #define MAX_TEXT 100
-#define MAX_IMAGE_BYTES 10240
+#define MAX_IMAGE_BYTES 38400   // 640x480 1-bit
+#define MAX_IMG_W 640
+#define MAX_IMG_H 480
 #define MAX_CARDS 65535
 
 // ============================================================
@@ -203,6 +205,29 @@ void sendStatus(uint8_t refType, uint8_t status) {
 // ============================================================
 // Storage report (ESP -> App): [0x81][total u32 LE][used u32 LE]
 // ============================================================
+
+// GET_INFO reply (ESP -> App): [0x82][ver u8][maxW u16][maxH u16][maxImgBytes u32][maxText u8][flags u8]
+// flags bit0 = firmware accepts RGB565 color images (not yet)
+void sendInfo() {
+
+    if (!txCharacteristic || !bleConnected)
+        return;
+
+    uint8_t p[12];
+
+    p[0] = 0x82;
+    p[1] = 1;
+    p[2] = MAX_IMG_W & 0xFF;
+    p[3] = (MAX_IMG_W >> 8) & 0xFF;
+    p[4] = MAX_IMG_H & 0xFF;
+    p[5] = (MAX_IMG_H >> 8) & 0xFF;
+    putU32(p + 6, (uint32_t)MAX_IMAGE_BYTES);
+    p[10] = MAX_TEXT;
+    p[11] = 0x00;
+
+    txCharacteristic->setValue(p, sizeof(p));
+    txCharacteristic->notify();
+}
 
 void sendStorage() {
 
@@ -445,8 +470,8 @@ bool sendImageToRP(uint32_t id) {
 
     if (w == 0 ||
         h == 0 ||
-        w > 320 ||
-        h > 240 ||
+        w > MAX_IMG_W ||
+        h > MAX_IMG_H ||
         len > MAX_IMAGE_BYTES ||
         f.size() < (uint32_t)(4 + len)) {
 
@@ -746,7 +771,8 @@ void beginImage(
     const uint8_t* p,
     size_t len) {
 
-    if (!syncActive || len != 12) {
+    // 12 bytes = 1-bit image (original). 13 bytes = extra trailing format byte (0 = 1-bit, 1 = RGB565 color).
+    if (!syncActive || (len != 12 && len != 13)) {
         sendStatus(0x03, 1);
         return;
     }
@@ -756,14 +782,22 @@ void beginImage(
     uint16_t h = u16le(p + 6);
     uint32_t dataLen = u32le(p + 8);
 
+    if (len == 13 && p[12] != 0) {
+        // TODO(color): accept RGB565 (format 1) here once the ESP can store it and the RP2040 can draw it.
+        // The app skips color images when it gets this error and keeps syncing the rest.
+        Serial.println("IMG color format not supported yet");
+        sendStatus(0x03, 1);
+        return;
+    }
+
     uint32_t expected =
         ((uint32_t)(w + 7) / 8) * h;
 
     if (id == 0 ||
         w == 0 ||
         h == 0 ||
-        w > 320 ||
-        h > 240 ||
+        w > MAX_IMG_W ||
+        h > MAX_IMG_H ||
         dataLen != expected ||
         dataLen > MAX_IMAGE_BYTES) {
 
@@ -1145,6 +1179,11 @@ void handleBLEPacket(
         case 0x07: // GET_STORAGE
 
             sendStorage();
+            break;
+
+        case 0x08: // GET_INFO
+
+            sendInfo();
             break;
 
         default:
