@@ -79,7 +79,7 @@ static const int MAX_COLOR_W = 320;
 static const int MAX_COLOR_H = 240;
 static const uint32_t MAX_COLOR_BYTES = (uint32_t)MAX_COLOR_W * MAX_COLOR_H * 2UL;
 
-static const int IMAGE_HEADER_Y = 34;
+static const int IMAGE_HEADER_Y = 38;   /* SAFE_TOP + HEADER_H + 4 */
 static const int IMAGE_FOOTER_H = 52;
 
 #define RGB565_WHITE 0xFFFF
@@ -89,11 +89,37 @@ static const int IMAGE_FOOTER_H = 52;
 // LVGL
 // ============================================================
 
+/* ---- UI layout (tune these if the glasses crop the edges of the picture) ---- */
+static const int SAFE_X      = 14;   // left/right margin in pixels (320x240 canvas)
+static const int SAFE_TOP    = 10;   // top margin
+static const int SAFE_BOTTOM = 10;   // bottom margin
+static const int HEADER_H    = 24;   // folder name + progress bar row
+static const int BAR_W       = 44;   // progress bar width  (was 88)
+static const int BAR_H       = 4;    // progress bar height (was 6 + border)
+
 /* 8 rows * 320 pixels * 1 byte = 2,560 bytes. */
 #define LVGL_BUFFER_LINES 8
-static uint8_t lvglDrawBuffer[DISPLAY_W * LVGL_BUFFER_LINES];
+alignas(4) static uint8_t lvglDrawBuffer[DISPLAY_W * LVGL_BUFFER_LINES];
 static lv_display_t* lvglDisplay = nullptr;
 static lv_obj_t* uiRoot = nullptr;
+
+/*
+ * Palette layout (see initColorPalette):
+ *   0        = black
+ *   1..216   = 6x6x6 color cube
+ *   217..254 = 38-step gray ramp (gray 6..248)
+ *   255      = white
+ * LVGL renders the UI as 8-bit gray (L8). Mapping gray -> the gray ramp keeps
+ * the anti-aliased edges of the font, which is what removes the pixelated look.
+ */
+static inline uint8_t grayToPalette(uint8_t g) {
+    if (g <= 3)   return 0;
+    if (g >= 251) return 255;
+    int idx = 216 + ((int)g * 39 + 127) / 255;
+    if (idx < 217) idx = 217;
+    if (idx > 254) idx = 254;
+    return (uint8_t)idx;
+}
 
 void lvglFlush(
     lv_display_t* disp,
@@ -108,17 +134,16 @@ void lvglFlush(
         return;
     }
 
-    /*
-     * LVGL renders the UI as 8-bit grayscale (L8). OllO deliberately maps
-     * that UI to only two palette entries so anti-aliasing never creates a
-     * surprise color in the black/white interface.
-     */
+    const uint32_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_L8);
     uint8_t* frame = display.getBuffer();
+
     for (int32_t y = 0; y < height; y++) {
-        uint8_t* dst = frame + ((area->y1 + y) * DISPLAY_W) + area->x1;
-        const uint8_t* src = px_map + (y * width);
+        const int32_t fy = area->y1 + y;
+        if (fy < 0 || fy >= DISPLAY_H) continue;
+        uint8_t* dst = frame + (fy * DISPLAY_W) + area->x1;
+        const uint8_t* src = px_map + (y * stride);
         for (int32_t x = 0; x < width; x++) {
-            dst[x] = (src[x] < 128) ? 0 : 255;
+            dst[x] = grayToPalette(src[x]);
         }
     }
 
@@ -152,6 +177,9 @@ void initColorPalette() {
 void initLvgl() {
     lv_init();
 
+    /* LVGL reads the real clock, so redraws never depend on loop timing. */
+    lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
+
     lvglDisplay = lv_display_create(DISPLAY_W, DISPLAY_H);
     if (!lvglDisplay) {
         Serial.println("LVGL display creation FAILED");
@@ -174,21 +202,20 @@ void initLvgl() {
     lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, LV_PART_MAIN);
 }
 
-void makeLabel(
+static lv_obj_t* makeLabel(
     const char* text,
+    const lv_font_t* font,
     int width,
     int height,
     lv_align_t align,
     int x,
     int y,
-    bool wrap,
+    lv_label_long_mode_t mode,
     bool center
 ) {
     lv_obj_t* label = lv_label_create(uiRoot);
+    lv_label_set_long_mode(label, mode);
     lv_label_set_text(label, text ? text : "");
-    if (wrap) {
-        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    }
     lv_obj_set_width(label, width);
     if (height > 0)
         lv_obj_set_height(label, height);
@@ -197,9 +224,10 @@ void makeLabel(
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 
     lv_obj_set_style_text_color(label, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
     lv_obj_set_style_pad_all(label, 0, LV_PART_MAIN);
     lv_obj_align(label, align, x, y);
+    return label;
 }
 
 void renderUi(
@@ -214,7 +242,7 @@ void renderUi(
     int* outImageX,
     int* outImageY
 ) {
-    (void)cardNo;
+    (void)imageFormat;
 
     if (!uiRoot)
         return;
@@ -224,54 +252,51 @@ void renderUi(
     lv_obj_set_style_bg_color(uiRoot, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, LV_PART_MAIN);
 
-    const int topMargin = 5;
-    const int leftMargin = 10;
-    const int progressW = 88;
-    const int progressH = 6;
-    const int progressRight = 10;
-
+    /* ---- Header: folder name (left) + small progress bar (right) ---- */
     char safeFolder[MAX_FOLDER_NAME + 1];
     strncpy(safeFolder, folder && folder[0] ? folder : "OllO", MAX_FOLDER_NAME);
     safeFolder[MAX_FOLDER_NAME] = '\0';
 
+    const int folderW = DISPLAY_W - (2 * SAFE_X) - BAR_W - 12;
     makeLabel(
         safeFolder,
-        DISPLAY_W - progressW - 28,
-        24,
+        &lv_font_montserrat_14,
+        folderW,
+        HEADER_H - 4,
         LV_ALIGN_TOP_LEFT,
-        leftMargin,
-        topMargin,
-        false,
+        SAFE_X,
+        SAFE_TOP,
+        LV_LABEL_LONG_DOT,
         false
     );
 
     lv_obj_t* bar = lv_bar_create(uiRoot);
-    lv_obj_set_size(bar, progressW, progressH);
-    lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, -progressRight, 8);
+    lv_obj_set_size(bar, BAR_W, BAR_H);
+    lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, -SAFE_X, SAFE_TOP + 6);
     lv_bar_set_range(bar, 0, total > 0 ? total : 1);
     lv_bar_set_value(bar, total > 0 ? min((int)cardNo, (int)total) : 0, LV_ANIM_OFF);
 
-    lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0xB4B4B4), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(bar, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_pad_all(bar, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
 
-    lv_obj_set_style_radius(bar, 1, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(bar, lv_color_hex(0x000000), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
 
     lv_obj_t* separator = lv_obj_create(uiRoot);
     lv_obj_remove_style_all(separator);
-    lv_obj_set_size(separator, DISPLAY_W - 20, 1);
+    lv_obj_set_size(separator, DISPLAY_W - (2 * SAFE_X), 1);
     lv_obj_set_style_bg_color(separator, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(separator, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, SAFE_TOP + HEADER_H);
 
     if (outImageX) *outImageX = 0;
     if (outImageY) *outImageY = 0;
 
+    /* ---- Body ---- */
     if (hasImage && imageW > 0 && imageH > 0) {
         const int imageAreaTop = IMAGE_HEADER_Y;
         const int imageAreaBottom = DISPLAY_H - IMAGE_FOOTER_H;
@@ -289,31 +314,34 @@ void renderUi(
         if (outImageX) *outImageX = x;
         if (outImageY) *outImageY = y;
 
-        /* The actual image is drawn after LVGL flush to avoid a full image framebuffer. */
+        /* The picture itself is drawn after the LVGL flush (no image framebuffer). */
         makeLabel(
             text,
-            DISPLAY_W - 36,
-            IMAGE_FOOTER_H - 14,
+            &lv_font_montserrat_16,
+            DISPLAY_W - (2 * SAFE_X),
+            IMAGE_FOOTER_H - SAFE_BOTTOM,
             LV_ALIGN_BOTTOM_MID,
             0,
-            -8,
-            true,
+            -SAFE_BOTTOM,
+            LV_LABEL_LONG_WRAP,
             true
         );
     } else {
         makeLabel(
             text,
-            DISPLAY_W - 28,
-            DISPLAY_H - 70,
+            &lv_font_montserrat_20,
+            DISPLAY_W - (2 * SAFE_X),
+            0,                      /* auto height so the text block is truly centered */
             LV_ALIGN_CENTER,
             0,
-            18,
-            true,
+            (SAFE_TOP + HEADER_H) / 2,
+            LV_LABEL_LONG_WRAP,
             true
         );
     }
 
-    lv_timer_handler();
+    /* Draw right now so the picture that follows is never wiped by a later refresh. */
+    lv_refr_now(lvglDisplay);
 }
 
 // ============================================================
@@ -719,8 +747,7 @@ void loop() {
         }
     }
 
-    /* 1 ms tick; animations are disabled, but LVGL timers still need a clock. */
-    lv_tick_inc(1);
+    /* LVGL reads the real clock through lv_tick_set_cb() in initLvgl(). */
     lv_timer_handler();
     delay(1);
 }

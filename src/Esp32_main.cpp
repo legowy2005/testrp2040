@@ -12,6 +12,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <LittleFS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // ============================================================
 // BLE UUIDs
@@ -70,8 +72,25 @@ HardwareSerial RPSerial(1);
 NimBLEServer* bleServer = nullptr;
 NimBLECharacteristic* txCharacteristic = nullptr;
 
-bool bleConnected = false;
+volatile bool bleConnected = false;
 volatile bool bleDropped = false;
+
+/*
+ * BLE writes are only COPIED into this queue inside the NimBLE callback.
+ * All real work (LittleFS writes, UART to the RP2040, notifications) runs in
+ * loop(). Doing that work inside the callback blocked the BLE host task, which
+ * is what made the link drop and reconnect in the middle of a sync.
+ */
+#define BLE_RX_MAX       260
+#define BLE_RX_QUEUE_LEN 40
+
+struct BlePacket {
+    uint16_t len;
+    uint8_t data[BLE_RX_MAX];
+};
+
+static QueueHandle_t bleRxQueue = nullptr;
+volatile uint32_t bleRxOverflow = 0;
 
 // ============================================================
 // Sync state
@@ -985,15 +1004,27 @@ class WriteCallbacks : public NimBLECharacteristicCallbacks {
         NimBLEConnInfo& connInfo
     ) override {
         std::string value = characteristic->getValue();
-        if (value.empty())
+        if (value.empty() || value.size() > BLE_RX_MAX || !bleRxQueue)
             return;
 
-        handleBLEPacket(
-            reinterpret_cast<const uint8_t*>(value.data()),
-            value.size()
-        );
+        BlePacket pkt;
+        pkt.len = (uint16_t)value.size();
+        memcpy(pkt.data, value.data(), value.size());
+
+        // Never do real work here - just hand the packet to loop().
+        if (xQueueSend(bleRxQueue, &pkt, pdMS_TO_TICKS(30)) != pdTRUE)
+            bleRxOverflow = bleRxOverflow + 1;
     }
 };
+
+void processBleQueue() {
+    if (!bleRxQueue)
+        return;
+
+    BlePacket pkt;
+    while (xQueueReceive(bleRxQueue, &pkt, 0) == pdTRUE)
+        handleBLEPacket(pkt.data, pkt.len);
+}
 
 // ============================================================
 // Card navigation commands
@@ -1152,6 +1183,10 @@ void setup() {
     padBack.last = digitalRead(TOUCH_BACK_PIN);
     padFront.last = digitalRead(TOUCH_FRONT_PIN);
 
+    bleRxQueue = xQueueCreate(BLE_RX_QUEUE_LEN, sizeof(BlePacket));
+    if (!bleRxQueue)
+        Serial.println("BLE rx queue creation FAILED");
+
     NimBLEDevice::init("Ollo");
 
     bleServer = NimBLEDevice::createServer();
@@ -1186,11 +1221,19 @@ void setup() {
 void loop() {
     if (bleDropped) {
         bleDropped = false;
+        if (bleRxQueue)
+            xQueueReset(bleRxQueue);   // drop anything left from the old link
         abortSync();
+    }
+
+    processBleQueue();
+
+    if (bleRxOverflow) {
+        Serial.printf("BLE rx queue overflow (%lu packets dropped)\n", (unsigned long)bleRxOverflow);
+        bleRxOverflow = 0;
     }
 
     readRPCommands();
     readTouch();
     delay(1);
 }
-    

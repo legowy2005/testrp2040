@@ -7,13 +7,14 @@
 #define LV_USE_STDLIB_SPRINTF LV_STDLIB_CLIB
 #define LV_USE_OS LV_OS_NONE
 
-/* The UI is intentionally monochrome, so LVGL can render one byte/pixel. */
 #define LV_COLOR_FORMAT_DEFAULT LV_COLOR_FORMAT_L8
 #define LV_USE_DRAW_SW 1
 
-/* Readable non-pixelated font. */
+/* Anti-aliased Montserrat: 14 = folder name, 16 = image caption, 20 = card text */
+#define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
-#define LV_FONT_DEFAULT LV_FONT_DEFAULT_MONTSERRAT_16
+#define LV_FONT_MONTSERRAT_20 1
+#define LV_FONT_DEFAULT &lv_font_montserrat_16
 
 #define LV_USE_LOG 0
 #define LV_USE_PERF_MONITOR 0
