@@ -36,7 +36,7 @@ static const char* NOTIFY_UUID =
 
 #define UART_TX 4
 #define UART_RX 5
-#define UART_BAUD 1000000   // must match the RP2040 side (higher = faster screen updates)
+#define UART_BAUD 2000000   // must match the RP2040 side (higher = faster screen updates)
 
 HardwareSerial RPSerial(1);
 
@@ -369,31 +369,36 @@ void cleanupUnusedImages() {
 // ============================================================
 // Display pipeline
 //
-// The ESP32 renders the whole UI with LVGL into a 320x240 8-bit framebuffer (palette
-// indices, see ollo_frame.h) and streams it to the RP2040, which only shows it.
+// The ESP32 renders the whole UI with LVGL into a 1-bit 640x480 framebuffer (black/white,
+// see ollo_frame.h) and streams it to the RP2040, which only shows it.
 // ============================================================
 
 #define DISPLAY_W OLLO_FRAME_W
 #define DISPLAY_H OLLO_FRAME_H
 
 /* ---- UI layout (tune these if the glasses crop the edges of the picture) ---- */
-static const int SAFE_X         = 14;   // left/right margin in pixels
-static const int SAFE_TOP       = 10;   // top margin
-static const int SAFE_BOTTOM    = 10;   // bottom margin
-static const int HEADER_H       = 24;   // folder name + progress bar row
-static const int BAR_W          = 44;   // progress bar width
-static const int BAR_H          = 4;    // progress bar height
-static const int IMAGE_HEADER_Y = 38;   // SAFE_TOP + HEADER_H + 4
-static const int IMAGE_FOOTER_H = 52;
+// (values were tuned for 320x240; UI_SCALE doubles them for the 640x480 screen)
+#define UI_SCALE (DISPLAY_W / 320)
+#define FONT_SMALL  (&lv_font_montserrat_28)
+#define FONT_MEDIUM (&lv_font_montserrat_32)
+#define FONT_LARGE  (&lv_font_montserrat_40)
+static const int SAFE_X         = 14 * UI_SCALE;   // left/right margin in pixels
+static const int SAFE_TOP       = 10 * UI_SCALE;   // top margin
+static const int SAFE_BOTTOM    = 10 * UI_SCALE;   // bottom margin
+static const int HEADER_H       = 24 * UI_SCALE;   // folder name + progress bar row
+static const int BAR_W          = 44 * UI_SCALE;   // progress bar width
+static const int BAR_H          = 4 * UI_SCALE;    // progress bar height
+static const int IMAGE_HEADER_Y = 38 * UI_SCALE;   // SAFE_TOP + HEADER_H + 4
+static const int IMAGE_FOOTER_H = 52 * UI_SCALE;
 
 #define LV_BUF_LINES 20
 alignas(4) static uint8_t lvDrawBuf[DISPLAY_W * LV_BUF_LINES * 2];   // RGB565
 
-static uint8_t* frameBuf = nullptr;      // 320x240 palette indices
+static uint8_t* frameBuf = nullptr;      // packed 1-bit pixels, OLLO_ROW_BYTES per row
 static lv_display_t* lvDisp = nullptr;
 static lv_obj_t* uiRoot = nullptr;
 
-/* LVGL hands us finished RGB565 strips; convert them to palette indices. */
+/* LVGL hands us finished RGB565 strips; threshold them to black/white. */
 static void lvFlush(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
     const int w = area->x2 - area->x1 + 1;
     const uint32_t stride = lv_draw_buf_width_to_stride(w, LV_COLOR_FORMAT_RGB565);
@@ -401,21 +406,23 @@ static void lvFlush(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) 
     for (int y = area->y1; y <= area->y2; y++) {
         const uint16_t* src = (const uint16_t*)(px_map + (uint32_t)(y - area->y1) * stride);
         if (y >= 0 && y < DISPLAY_H) {
-            uint8_t* dst = frameBuf + (size_t)y * DISPLAY_W + area->x1;
-            for (int x = 0; x < w; x++)
-                dst[x] = olloRgb565ToPalette(src[x]);
+            for (int x = 0; x < w; x++) {
+                const int fx = area->x1 + x;
+                if (fx >= 0 && fx < DISPLAY_W)
+                    olloPutPixel(frameBuf, fx, y, olloRgb565ToGray(src[x]) >= 128);
+            }
         }
     }
     lv_display_flush_ready(disp);
 }
 
 void initUiRenderer() {
-    frameBuf = (uint8_t*)malloc((size_t)DISPLAY_W * DISPLAY_H);
+    frameBuf = (uint8_t*)malloc(OLLO_FRAME_BYTES);
     if (!frameBuf) {
         Serial.println("Frame buffer alloc FAILED");
         while (true) delay(1000);
     }
-    memset(frameBuf, 255, (size_t)DISPLAY_W * DISPLAY_H);
+    memset(frameBuf, OLLO_FILL_WHITE, OLLO_FRAME_BYTES);   // start all white
 
     lv_init();
     lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
@@ -477,7 +484,7 @@ static void renderUi(
     safeFolder[MAX_FOLDER_NAME] = '\0';
 
     const int folderW = DISPLAY_W - (2 * SAFE_X) - BAR_W - 12;
-    makeLabel(safeFolder, &lv_font_montserrat_14, folderW, HEADER_H - 4,
+    makeLabel(safeFolder, FONT_SMALL, folderW, HEADER_H - 4,
               LV_ALIGN_TOP_LEFT, SAFE_X, SAFE_TOP, LV_LABEL_LONG_DOT, false);
 
     lv_obj_t* bar = lv_bar_create(uiRoot);
@@ -487,9 +494,10 @@ static void renderUi(
     lv_bar_set_value(bar, total > 0 ? min((int)cardNo, (int)total) : 0, LV_ANIM_OFF);
 
     lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0xB4B4B4), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, UI_SCALE, LV_PART_MAIN);   // 1-bit screen: outline instead of a gray track
+    lv_obj_set_style_border_color(bar, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
 
     lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_INDICATOR);
@@ -498,18 +506,18 @@ static void renderUi(
 
     lv_obj_t* separator = lv_obj_create(uiRoot);
     lv_obj_remove_style_all(separator);
-    lv_obj_set_size(separator, DISPLAY_W - (2 * SAFE_X), 1);
+    lv_obj_set_size(separator, DISPLAY_W - (2 * SAFE_X), UI_SCALE);
     lv_obj_set_style_bg_color(separator, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(separator, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, SAFE_TOP + HEADER_H);
 
     /* ---- Body ---- */
     if (hasImage) {
-        makeLabel(text, &lv_font_montserrat_16, DISPLAY_W - (2 * SAFE_X),
+        makeLabel(text, FONT_MEDIUM, DISPLAY_W - (2 * SAFE_X),
                   IMAGE_FOOTER_H - SAFE_BOTTOM, LV_ALIGN_BOTTOM_MID, 0, -SAFE_BOTTOM,
                   LV_LABEL_LONG_WRAP, true);
     } else {
-        makeLabel(text, &lv_font_montserrat_20, DISPLAY_W - (2 * SAFE_X), 0,
+        makeLabel(text, FONT_LARGE, DISPLAY_W - (2 * SAFE_X), 0,
                   LV_ALIGN_CENTER, 0, (SAFE_TOP + HEADER_H) / 2,
                   LV_LABEL_LONG_WRAP, true);
     }
@@ -590,7 +598,8 @@ static void blitImage(File& f, const ImageInfo& info) {
     const int areaH = DISPLAY_H - IMAGE_FOOTER_H - IMAGE_HEADER_Y;
     const float scaleW = (float)(DISPLAY_W - 20) / (float)w;
     const float scaleH = (float)areaH / (float)h;
-    const float scale = min(1.0f, min(scaleW, scaleH));
+    const float maxScale = mono ? 1.0f : (float)UI_SCALE;   // colour images are at most 320x240, so enlarge them
+    const float scale = min(maxScale, min(scaleW, scaleH));
     const int targetW = max(1, (int)(w * scale));
     const int targetH = max(1, (int)(h * scale));
     const int x0 = (DISPLAY_W - targetW) / 2;
@@ -612,17 +621,24 @@ static void blitImage(File& f, const ImageInfo& info) {
         const int fy = y0 + dy;
         if (fy < 0 || fy >= DISPLAY_H)
             continue;
-        uint8_t* dst = frameBuf + (size_t)fy * DISPLAY_W + x0;
 
         for (int dx = 0; dx < targetW; dx++) {
+            const int fx = x0 + dx;
+            if (fx < 0 || fx >= DISPLAY_W)
+                continue;
             const int sx = min(w - 1, (dx * w) / targetW);
+            bool white;
             if (mono) {
-                const bool white = (rowBuf[sx >> 3] & (0x80 >> (sx & 7))) != 0;
-                dst[dx] = white ? 255 : 0;
+                white = (rowBuf[sx >> 3] & (0x80 >> (sx & 7))) != 0;
             } else {
+                // colour photo -> black/white with a 4x4 ordered dither (looks like grays)
+                static const uint8_t bayer4[4][4] = {
+                    { 0,  8,  2, 10}, {12,  4, 14,  6},
+                    { 3, 11,  1,  9}, {15,  7, 13,  5}};
                 const uint16_t px = (uint16_t)rowBuf[sx * 2] | ((uint16_t)rowBuf[sx * 2 + 1] << 8);
-                dst[dx] = olloRgb565ToPalette(px);
+                white = (int)olloRgb565ToGray(px) > (int)bayer4[fy & 3][fx & 3] * 16 + 8;
             }
+            olloPutPixel(frameBuf, fx, fy, white);
         }
     }
 }
@@ -630,16 +646,16 @@ static void blitImage(File& f, const ImageInfo& info) {
 // ---------- sending the frame to the RP2040 ----------
 
 static void sendFrameToRP() {
-    static uint8_t pkt[3 + DISPLAY_W];
-    static uint8_t enc[DISPLAY_W];
+    static uint8_t pkt[3 + OLLO_ROW_BYTES];
+    static uint8_t enc[OLLO_ROW_BYTES];
 
     const uint8_t header[3] = {OLLO_MAGIC0, OLLO_MAGIC1, OLLO_CMD_FRAME};
     RPSerial.write(header, 3);
 
     uint8_t sum = 0;
     for (int y = 0; y < DISPLAY_H; y++) {
-        const uint8_t* row = frameBuf + (size_t)y * DISPLAY_W;
-        for (int x = 0; x < DISPLAY_W; x++)
+        const uint8_t* row = frameBuf + (size_t)y * OLLO_ROW_BYTES;
+        for (int x = 0; x < OLLO_ROW_BYTES; x++)
             sum += row[x];
 
         const size_t n = olloRleEncodeRow(row, enc);
@@ -651,8 +667,8 @@ static void sendFrameToRP() {
             RPSerial.write(pkt, 3 + n);
         } else {
             pkt[0] = OLLO_ROW_RAW;
-            memcpy(pkt + 1, row, DISPLAY_W);
-            RPSerial.write(pkt, 1 + DISPLAY_W);
+            memcpy(pkt + 1, row, OLLO_ROW_BYTES);
+            RPSerial.write(pkt, 1 + OLLO_ROW_BYTES);
         }
     }
 
