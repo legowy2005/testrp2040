@@ -478,6 +478,17 @@ static void renderUi(
     lv_obj_set_style_bg_color(uiRoot, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, LV_PART_MAIN);
 
+    /*
+     * Image cards are full-screen image frames.
+     * Do not reserve space for the normal header/caption UI.
+     * The framebuffer is cleared here; blitImage() then fills as much of
+     * the 640x480 display as the image aspect ratio allows.
+     */
+    if (hasImage) {
+        memset(frameBuf, OLLO_FILL_WHITE, OLLO_FRAME_BYTES);
+        return;
+    }
+
     /* ---- Header: folder name (left) + small progress bar (right) ---- */
     char safeFolder[MAX_FOLDER_NAME + 1];
     strncpy(safeFolder, folder && folder[0] ? folder : "OllO", MAX_FOLDER_NAME);
@@ -595,15 +606,21 @@ static void blitImage(File& f, const ImageInfo& info) {
     const int h = info.h;
     const bool mono = info.format == IMAGE_FORMAT_MONO;
 
-    const int areaH = DISPLAY_H - IMAGE_FOOTER_H - IMAGE_HEADER_Y;
-    const float scaleW = (float)(DISPLAY_W - 20) / (float)w;
-    const float scaleH = (float)areaH / (float)h;
-    const float maxScale = mono ? 1.0f : (float)UI_SCALE;   // colour images are at most 320x240, so enlarge them
-    const float scale = min(maxScale, min(scaleW, scaleH));
+    /*
+     * Images now use the entire physical display.
+     * Preserve aspect ratio; the only remaining empty area is a white bar
+     * when the source aspect ratio does not match 640:480.
+     *
+     * Mono images are no longer capped at 1.0x, so a 320x240 image
+     * can be enlarged to 640x480.
+     */
+    const float scaleW = (float)DISPLAY_W / (float)w;
+    const float scaleH = (float)DISPLAY_H / (float)h;
+    const float scale = min(scaleW, scaleH);
     const int targetW = max(1, (int)(w * scale));
     const int targetH = max(1, (int)(h * scale));
     const int x0 = (DISPLAY_W - targetW) / 2;
-    const int y0 = IMAGE_HEADER_Y + (areaH - targetH) / 2;
+    const int y0 = (DISPLAY_H - targetH) / 2;
 
     static uint8_t rowBuf[MAX_COLOR_IMG_W * 2];   // largest row: 320 RGB565 px = 640 B (mono max 80 B)
     const uint32_t rowBytes = mono ? (uint32_t)((w + 7) / 8) : (uint32_t)w * 2UL;
