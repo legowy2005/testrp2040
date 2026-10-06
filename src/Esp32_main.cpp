@@ -14,6 +14,8 @@
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <lvgl.h>
+#include "ollo_frame.h"
 
 // ============================================================
 // BLE UUIDs
@@ -34,7 +36,7 @@ static const char* NOTIFY_UUID =
 
 #define UART_TX 4
 #define UART_RX 5
-#define UART_BAUD 230400
+#define UART_BAUD 1000000   // must match the RP2040 side (higher = faster screen updates)
 
 HardwareSerial RPSerial(1);
 
@@ -365,108 +367,297 @@ void cleanupUnusedImages() {
 }
 
 // ============================================================
-// UART display bridge
+// Display pipeline
+//
+// The ESP32 renders the whole UI with LVGL into a 320x240 8-bit framebuffer (palette
+// indices, see ollo_frame.h) and streams it to the RP2040, which only shows it.
 // ============================================================
 
-void sendNoImage() {
-    RPSerial.print("N\n");
+#define DISPLAY_W OLLO_FRAME_W
+#define DISPLAY_H OLLO_FRAME_H
+
+/* ---- UI layout (tune these if the glasses crop the edges of the picture) ---- */
+static const int SAFE_X         = 14;   // left/right margin in pixels
+static const int SAFE_TOP       = 10;   // top margin
+static const int SAFE_BOTTOM    = 10;   // bottom margin
+static const int HEADER_H       = 24;   // folder name + progress bar row
+static const int BAR_W          = 44;   // progress bar width
+static const int BAR_H          = 4;    // progress bar height
+static const int IMAGE_HEADER_Y = 38;   // SAFE_TOP + HEADER_H + 4
+static const int IMAGE_FOOTER_H = 52;
+
+#define LV_BUF_LINES 20
+alignas(4) static uint8_t lvDrawBuf[DISPLAY_W * LV_BUF_LINES * 2];   // RGB565
+
+static uint8_t* frameBuf = nullptr;      // 320x240 palette indices
+static lv_display_t* lvDisp = nullptr;
+static lv_obj_t* uiRoot = nullptr;
+
+/* LVGL hands us finished RGB565 strips; convert them to palette indices. */
+static void lvFlush(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
+    const int w = area->x2 - area->x1 + 1;
+    const uint32_t stride = lv_draw_buf_width_to_stride(w, LV_COLOR_FORMAT_RGB565);
+
+    for (int y = area->y1; y <= area->y2; y++) {
+        const uint16_t* src = (const uint16_t*)(px_map + (uint32_t)(y - area->y1) * stride);
+        if (y >= 0 && y < DISPLAY_H) {
+            uint8_t* dst = frameBuf + (size_t)y * DISPLAY_W + area->x1;
+            for (int x = 0; x < w; x++)
+                dst[x] = olloRgb565ToPalette(src[x]);
+        }
+    }
+    lv_display_flush_ready(disp);
 }
 
-bool sendImageToRP(uint32_t id) {
-    if (id == 0) {
-        sendNoImage();
-        return true;
+void initUiRenderer() {
+    frameBuf = (uint8_t*)malloc((size_t)DISPLAY_W * DISPLAY_H);
+    if (!frameBuf) {
+        Serial.println("Frame buffer alloc FAILED");
+        while (true) delay(1000);
+    }
+    memset(frameBuf, 255, (size_t)DISPLAY_W * DISPLAY_H);
+
+    lv_init();
+    lv_tick_set_cb([]() -> uint32_t { return (uint32_t)millis(); });
+
+    lvDisp = lv_display_create(DISPLAY_W, DISPLAY_H);
+    lv_display_set_color_format(lvDisp, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_buffers(lvDisp, lvDrawBuf, nullptr, sizeof(lvDrawBuf),
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(lvDisp, lvFlush);
+
+    uiRoot = lv_screen_active();
+    lv_obj_set_style_bg_color(uiRoot, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, LV_PART_MAIN);
+}
+
+static lv_obj_t* makeLabel(
+    const char* text,
+    const lv_font_t* font,
+    int width,
+    int height,
+    lv_align_t align,
+    int x,
+    int y,
+    lv_label_long_mode_t mode,
+    bool center
+) {
+    lv_obj_t* label = lv_label_create(uiRoot);
+    lv_label_set_long_mode(label, mode);
+    lv_label_set_text(label, text ? text : "");
+    lv_obj_set_width(label, width);
+    if (height > 0)
+        lv_obj_set_height(label, height);
+
+    if (center)
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+
+    lv_obj_set_style_text_color(label, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_text_font(label, font, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(label, 0, LV_PART_MAIN);
+    lv_obj_align(label, align, x, y);
+    return label;
+}
+
+/* Builds the card UI and renders it into frameBuf (image area is left white). */
+static void renderUi(
+    uint16_t cardNo,
+    uint16_t total,
+    const char* folder,
+    const char* text,
+    bool hasImage
+) {
+    lv_obj_clean(uiRoot);
+    lv_obj_set_style_bg_color(uiRoot, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(uiRoot, LV_OPA_COVER, LV_PART_MAIN);
+
+    /* ---- Header: folder name (left) + small progress bar (right) ---- */
+    char safeFolder[MAX_FOLDER_NAME + 1];
+    strncpy(safeFolder, folder && folder[0] ? folder : "OllO", MAX_FOLDER_NAME);
+    safeFolder[MAX_FOLDER_NAME] = '\0';
+
+    const int folderW = DISPLAY_W - (2 * SAFE_X) - BAR_W - 12;
+    makeLabel(safeFolder, &lv_font_montserrat_14, folderW, HEADER_H - 4,
+              LV_ALIGN_TOP_LEFT, SAFE_X, SAFE_TOP, LV_LABEL_LONG_DOT, false);
+
+    lv_obj_t* bar = lv_bar_create(uiRoot);
+    lv_obj_set_size(bar, BAR_W, BAR_H);
+    lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, -SAFE_X, SAFE_TOP + 6);
+    lv_bar_set_range(bar, 0, total > 0 ? total : 1);
+    lv_bar_set_value(bar, total > 0 ? min((int)cardNo, (int)total) : 0, LV_ANIM_OFF);
+
+    lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0xB4B4B4), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+
+    lv_obj_set_style_radius(bar, BAR_H / 2, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x000000), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+
+    lv_obj_t* separator = lv_obj_create(uiRoot);
+    lv_obj_remove_style_all(separator);
+    lv_obj_set_size(separator, DISPLAY_W - (2 * SAFE_X), 1);
+    lv_obj_set_style_bg_color(separator, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(separator, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, SAFE_TOP + HEADER_H);
+
+    /* ---- Body ---- */
+    if (hasImage) {
+        makeLabel(text, &lv_font_montserrat_16, DISPLAY_W - (2 * SAFE_X),
+                  IMAGE_FOOTER_H - SAFE_BOTTOM, LV_ALIGN_BOTTOM_MID, 0, -SAFE_BOTTOM,
+                  LV_LABEL_LONG_WRAP, true);
+    } else {
+        makeLabel(text, &lv_font_montserrat_20, DISPLAY_W - (2 * SAFE_X), 0,
+                  LV_ALIGN_CENTER, 0, (SAFE_TOP + HEADER_H) / 2,
+                  LV_LABEL_LONG_WRAP, true);
     }
 
-    File f = LittleFS.open(imagePath(id), "r");
-    if (!f) {
-        sendNoImage();
+    lv_obj_invalidate(uiRoot);   // redraw the whole screen so nothing from the last card survives
+    lv_refr_now(lvDisp);
+}
+
+// ---------- card images (read from LittleFS, drawn straight into frameBuf) ----------
+
+struct ImageInfo {
+    uint16_t w;
+    uint16_t h;
+    uint8_t format;
+    uint32_t dataOffset;
+};
+
+/* Opens and validates a stored image. Same file layout rules as the old bridge. */
+static bool openImage(uint32_t id, File& f, ImageInfo& info) {
+    if (id == 0)
         return false;
-    }
+
+    f = LittleFS.open(imagePath(id), "r");
+    if (!f)
+        return false;
 
     const uint32_t fileSize = (uint32_t)f.size();
-    if (fileSize < 4) {
-        f.close();
-        sendNoImage();
-        return false;
-    }
-
     uint8_t wh[4];
-    if (f.read(wh, 4) != 4) {
+    if (fileSize < 4 || f.read(wh, 4) != 4) {
         f.close();
-        sendNoImage();
         return false;
     }
 
     const uint16_t w = u16le(wh);
     const uint16_t h = u16le(wh + 2);
-
     const uint32_t monoLen = ((uint32_t)(w + 7) / 8) * h;
     const uint32_t colorLen = (uint32_t)w * h * 2UL;
     const uint32_t remaining = fileSize - 4;
 
-    uint8_t format = IMAGE_FORMAT_MONO;
-    bool hasFormatHeader = false;
-    uint32_t len = 0;
+    uint8_t format;
+    bool hasFormatHeader;
 
     if (remaining == colorLen + 1 && w > 0 && h > 0 && w <= MAX_COLOR_IMG_W && h <= MAX_COLOR_IMG_H) {
         format = IMAGE_FORMAT_RGB565;
         hasFormatHeader = true;
-        len = colorLen;
     } else if (remaining == monoLen + 1 && w > 0 && h > 0 && w <= MAX_IMG_W && h <= MAX_IMG_H) {
         format = IMAGE_FORMAT_MONO;
         hasFormatHeader = true;
-        len = monoLen;
     } else if (remaining == monoLen && w > 0 && h > 0 && w <= MAX_IMG_W && h <= MAX_IMG_H) {
-        // Backward-compatible old mono image header.
-        format = IMAGE_FORMAT_MONO;
+        format = IMAGE_FORMAT_MONO;      // old mono files without a format byte
         hasFormatHeader = false;
-        len = monoLen;
     } else {
         f.close();
-        sendNoImage();
         return false;
     }
 
     if (hasFormatHeader) {
-        uint8_t storedFormat = 0;
-        if (f.read(&storedFormat, 1) != 1 || storedFormat != format) {
+        uint8_t stored = 0;
+        if (f.read(&stored, 1) != 1 || stored != format) {
             f.close();
-            sendNoImage();
             return false;
         }
     }
 
-    RPSerial.printf(
-        "I\t%u\t%u\t%lu\t%u\n",
-        w,
-        h,
-        (unsigned long)len,
-        (unsigned)format
-    );
-
-    uint8_t buffer[256];
-    uint8_t checksum = 0;
-    uint32_t left = len;
-
-    while (left) {
-        size_t wanted = min<uint32_t>(left, sizeof(buffer));
-        size_t n = f.read(buffer, wanted);
-        if (n == 0) {
-            f.close();
-            return false;
-        }
-
-        for (size_t i = 0; i < n; i++)
-            checksum += buffer[i];
-
-        RPSerial.write(buffer, n);
-        left -= n;
-    }
-
-    RPSerial.write(checksum);
-    f.close();
+    info.w = w;
+    info.h = h;
+    info.format = format;
+    info.dataOffset = 4 + (hasFormatHeader ? 1 : 0);
     return true;
+}
+
+/* Scales the image to fit between header and caption and draws it into frameBuf. */
+static void blitImage(File& f, const ImageInfo& info) {
+    const int w = info.w;
+    const int h = info.h;
+    const bool mono = info.format == IMAGE_FORMAT_MONO;
+
+    const int areaH = DISPLAY_H - IMAGE_FOOTER_H - IMAGE_HEADER_Y;
+    const float scaleW = (float)(DISPLAY_W - 20) / (float)w;
+    const float scaleH = (float)areaH / (float)h;
+    const float scale = min(1.0f, min(scaleW, scaleH));
+    const int targetW = max(1, (int)(w * scale));
+    const int targetH = max(1, (int)(h * scale));
+    const int x0 = (DISPLAY_W - targetW) / 2;
+    const int y0 = IMAGE_HEADER_Y + (areaH - targetH) / 2;
+
+    static uint8_t rowBuf[MAX_COLOR_IMG_W * 2];   // largest row: 320 RGB565 px = 640 B (mono max 80 B)
+    const uint32_t rowBytes = mono ? (uint32_t)((w + 7) / 8) : (uint32_t)w * 2UL;
+    int lastSy = -1;
+
+    for (int dy = 0; dy < targetH; dy++) {
+        const int sy = min(h - 1, (dy * h) / targetH);
+        if (sy != lastSy) {
+            f.seek(info.dataOffset + (uint32_t)sy * rowBytes);
+            if (f.read(rowBuf, rowBytes) != (int)rowBytes)
+                return;
+            lastSy = sy;
+        }
+
+        const int fy = y0 + dy;
+        if (fy < 0 || fy >= DISPLAY_H)
+            continue;
+        uint8_t* dst = frameBuf + (size_t)fy * DISPLAY_W + x0;
+
+        for (int dx = 0; dx < targetW; dx++) {
+            const int sx = min(w - 1, (dx * w) / targetW);
+            if (mono) {
+                const bool white = (rowBuf[sx >> 3] & (0x80 >> (sx & 7))) != 0;
+                dst[dx] = white ? 255 : 0;
+            } else {
+                const uint16_t px = (uint16_t)rowBuf[sx * 2] | ((uint16_t)rowBuf[sx * 2 + 1] << 8);
+                dst[dx] = olloRgb565ToPalette(px);
+            }
+        }
+    }
+}
+
+// ---------- sending the frame to the RP2040 ----------
+
+static void sendFrameToRP() {
+    static uint8_t pkt[3 + DISPLAY_W];
+    static uint8_t enc[DISPLAY_W];
+
+    const uint8_t header[3] = {OLLO_MAGIC0, OLLO_MAGIC1, OLLO_CMD_FRAME};
+    RPSerial.write(header, 3);
+
+    uint8_t sum = 0;
+    for (int y = 0; y < DISPLAY_H; y++) {
+        const uint8_t* row = frameBuf + (size_t)y * DISPLAY_W;
+        for (int x = 0; x < DISPLAY_W; x++)
+            sum += row[x];
+
+        const size_t n = olloRleEncodeRow(row, enc);
+        if (n) {
+            pkt[0] = OLLO_ROW_RLE;
+            pkt[1] = (uint8_t)(n & 0xFF);
+            pkt[2] = (uint8_t)(n >> 8);
+            memcpy(pkt + 3, enc, n);
+            RPSerial.write(pkt, 3 + n);
+        } else {
+            pkt[0] = OLLO_ROW_RAW;
+            memcpy(pkt + 1, row, DISPLAY_W);
+            RPSerial.write(pkt, 1 + DISPLAY_W);
+        }
+    }
+
+    RPSerial.write(sum);
+    RPSerial.flush();
 }
 
 void sendCardToRP(uint16_t index, bool back) {
@@ -474,25 +665,29 @@ void sendCardToRP(uint16_t index, bool back) {
     if (!readCard(index, card))
         return;
 
-    const uint32_t image = back ? card.backImg : card.frontImg;
+    const uint32_t imageId = back ? card.backImg : card.frontImg;
     const String& text = back ? card.back : card.front;
 
-    // Send metadata first. The RP2040 prepares its UI before receiving a color image.
-    RPSerial.printf(
-        "%c\t%u\t%u\t%s\t%s\n",
-        back ? 'B' : 'F',
-        index + 1,
-        syncCardCount,
-        card.folder.c_str(),
-        text.c_str()
-    );
+    File cardImage;
+    ImageInfo info;
+    const bool hasImage = openImage(imageId, cardImage, info);
 
-    sendImageToRP(image);
+    renderUi(index + 1, syncCardCount, card.folder.c_str(), text.c_str(), hasImage);
+
+    if (hasImage) {
+        blitImage(cardImage, info);
+        cardImage.close();
+    }
+
+    sendFrameToRP();
 }
 
 void showCurrentCard() {
-    if (syncCardCount == 0)
+    if (syncCardCount == 0) {
+        renderUi(0, 0, "OllO", "No cards yet", false);
+        sendFrameToRP();
         return;
+    }
 
     sendCardToRP(currentCard, currentBack);
 }
@@ -1042,6 +1237,12 @@ void handleRPCommand(const String& command) {
         (int)currentBack
     );
 
+    if (command == "READY") {   // the RP2040 just booted: send it the current screen
+        if (!syncActive)
+            showCurrentCard();
+        return;
+    }
+
     if (syncActive || syncCardCount == 0)
         return;
 
@@ -1170,6 +1371,8 @@ void setup() {
 
     countCards();
     Serial.printf("Cards on flash: %u\n", syncCardCount);
+
+    initUiRenderer();
 
     RPSerial.begin(
         UART_BAUD,

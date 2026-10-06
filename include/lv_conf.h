@@ -1,13 +1,16 @@
 #ifndef LV_CONF_H
 #define LV_CONF_H
 
-/* Minimal LVGL 9.6 configuration for OllO's RAM-constrained RP2040 UI. */
+/* LVGL 9.6 configuration for the OllO ESP32-S3 UI renderer.
+ * LVGL renders into small RGB565 strips; the ESP32 converts them to the 8-bit palette
+ * framebuffer that is streamed to the RP2040 (see ollo_frame.h). */
+#define LV_COLOR_DEPTH 16
+
 #define LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB
 #define LV_USE_STDLIB_STRING LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF LV_STDLIB_CLIB
 #define LV_USE_OS LV_OS_NONE
 
-#define LV_COLOR_FORMAT_DEFAULT LV_COLOR_FORMAT_L8
 #define LV_USE_DRAW_SW 1
 
 /* Anti-aliased Montserrat: 14 = folder name, 16 = image caption, 20 = card text */
