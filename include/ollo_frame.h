@@ -1,15 +1,20 @@
 /*
  * OllO frame protocol - shared by the ESP32 (sender) and the RP2040 (receiver).
  *
- * 1-bit (black/white) 640x480 frames, 8 pixels per byte, MSB = leftmost pixel
- * (same bit order as Adafruit_GFX's 1-bit canvas and as the mono images in the app).
- * A bit equal to OLLO_BIT_WHITE is a white pixel.
+ * 2-bit grayscale (4 levels) 640x480 frames, 4 pixels per byte.
+ * Pixel x of a row lives in byte (x >> 2), at bit offset (x & 3) * 2, i.e. the LEFTMOST pixel
+ * is in the LEAST significant bits.  That is exactly the layout PicoDVI's tmds_encode_2bpp()
+ * reads, so the RP2040 can scan the received buffer out without reshuffling it.
+ * Level 0 = black, 1 = dark gray, 2 = light gray, 3 = white.
  *
  * Wire format (ESP32 -> RP2040):
- *   A5 5A 'F'
+ *   A5 5A 'G'
  *   OLLO_FRAME_H x row:  [enc]   enc 0 = RAW : OLLO_ROW_BYTES bytes follow
  *                                enc 1 = RLE : [len u16 LE] then len bytes of (count, value) pairs
  *   [checksum]   sum of all decoded bytes (H * ROW_BYTES of them), modulo 256
+ *
+ * (The old 1-bit protocol used 'F'; the different command byte means a half-updated pair of
+ *  boards simply shows nothing instead of garbage.)
  */
 #ifndef OLLO_FRAME_PROTOCOL_H
 #define OLLO_FRAME_PROTOCOL_H
@@ -20,16 +25,16 @@
 
 #define OLLO_FRAME_W     640
 #define OLLO_FRAME_H     480
-#define OLLO_ROW_BYTES   (OLLO_FRAME_W / 8)
+#define OLLO_ROW_BYTES   (OLLO_FRAME_W / 4)
 #define OLLO_FRAME_BYTES ((size_t)OLLO_ROW_BYTES * OLLO_FRAME_H)
 
-/* If the picture comes out inverted (white text on black), change this 1 to 0. */
-#define OLLO_BIT_WHITE   1
-#define OLLO_FILL_WHITE  (OLLO_BIT_WHITE ? 0xFF : 0x00)
+#define OLLO_LEVEL_BLACK 0
+#define OLLO_LEVEL_WHITE 3
+#define OLLO_FILL_WHITE  0xFF      /* every pixel = level 3 */
 
 #define OLLO_MAGIC0      0xA5
 #define OLLO_MAGIC1      0x5A
-#define OLLO_CMD_FRAME   'F'
+#define OLLO_CMD_FRAME   'G'
 #define OLLO_ROW_RAW     0
 #define OLLO_ROW_RLE     1
 
@@ -44,13 +49,21 @@ static inline uint8_t olloRgb565ToGray(uint16_t p) {
     return (uint8_t)((r * 77 + g * 151 + b * 28) >> 8);
 }
 
-/* Set one pixel in a packed 1-bit framebuffer (OLLO_ROW_BYTES per row). */
+/* 8-bit luma -> 2-bit level (0..3), rounded to the nearest level. */
+static inline uint8_t olloGrayToLevel(uint8_t gray) {
+    return (uint8_t)(((unsigned)gray * 3u + 127u) / 255u);
+}
+
+/* Set one pixel (level 0..3) in a packed 2-bit framebuffer (OLLO_ROW_BYTES per row). */
+static inline void olloPutLevel(uint8_t* fb, int x, int y, uint8_t level) {
+    uint8_t* p = fb + (size_t)y * OLLO_ROW_BYTES + (x >> 2);
+    const uint8_t shift = (uint8_t)((x & 3) * 2);
+    *p = (uint8_t)((*p & ~(0x03 << shift)) | ((level & 0x03) << shift));
+}
+
+/* Black/white convenience wrapper (used for the 1-bit card images). */
 static inline void olloPutPixel(uint8_t* fb, int x, int y, bool white) {
-    uint8_t* p = fb + (size_t)y * OLLO_ROW_BYTES + (x >> 3);
-    const uint8_t mask = (uint8_t)(0x80 >> (x & 7));
-    const bool bit = white ? (OLLO_BIT_WHITE != 0) : (OLLO_BIT_WHITE == 0);
-    if (bit) *p |= mask;
-    else     *p &= (uint8_t)~mask;
+    olloPutLevel(fb, x, y, white ? OLLO_LEVEL_WHITE : OLLO_LEVEL_BLACK);
 }
 
 /* RLE-encode one packed row. Returns the encoded length, or 0 if it is not smaller than raw. */

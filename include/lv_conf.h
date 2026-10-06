@@ -17,9 +17,7 @@
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 1
 #define LV_FONT_MONTSERRAT_20 1
-#define LV_FONT_MONTSERRAT_28 1
-#define LV_FONT_MONTSERRAT_32 1
-#define LV_FONT_MONTSERRAT_40 1
+/* card/header fonts are the custom ollo_font_28/32/40 in src/fonts */
 #define LV_FONT_DEFAULT &lv_font_montserrat_16
 
 #define LV_USE_LOG 0

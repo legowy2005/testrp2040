@@ -4,7 +4,7 @@
  *
  * Protocol v2 additions:
  *   - CARD packets can carry a folder name.
- *   - Images carry a format byte: 0 = 1-bit, 1 = RGB565 color.
+ *   - Images carry a format byte: 0 = 1-bit, 1 = RGB565 color, 2 = 2-bit gray (4 px/byte, LSB first).
  *   - RGB565 images are streamed to the RP2040; the ESP32 never needs
  *     a full-image RAM buffer.
  */
@@ -12,10 +12,12 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <LittleFS.h>
+#include <vector>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <lvgl.h>
 #include "ollo_frame.h"
+#include "ollo_fonts.h"
 
 // ============================================================
 // BLE UUIDs
@@ -56,8 +58,10 @@ HardwareSerial RPSerial(1);
 
 #define IMAGE_FORMAT_MONO   0
 #define IMAGE_FORMAT_RGB565 1
+#define IMAGE_FORMAT_GRAY2  2
 
 #define MAX_MONO_IMAGE_BYTES 38400UL       // 640x480 @ 1 bit
+#define MAX_GRAY2_IMAGE_BYTES 76800UL      // 640x480 @ 2 bit
 #define MAX_COLOR_IMAGE_BYTES 153600UL     // 320x240 @ RGB565
 #define MAX_IMAGE_BYTES MAX_COLOR_IMAGE_BYTES
 
@@ -189,7 +193,7 @@ void sendStatus(uint8_t refType, uint8_t status) {
 }
 
 // GET_INFO: [0x82][version][maxW u16][maxH u16][maxImg u32][maxText u8][flags]
-// flags bit0 = RGB565 supported
+// flags bit0 = RGB565 supported, bit1 = 2-bit gray images supported
 void sendInfo() {
     if (!txCharacteristic || !bleConnected)
         return;
@@ -203,7 +207,7 @@ void sendInfo() {
     p[5] = (MAX_IMG_H >> 8) & 0xFF;
     putU32(p + 6, (uint32_t)MAX_IMAGE_BYTES);
     p[10] = MAX_TEXT;
-    p[11] = 0x01; // RGB565 supported
+    p[11] = 0x03; // bit0 RGB565, bit1 2-bit gray
 
     txCharacteristic->setValue(p, sizeof(p));
     txCharacteristic->notify();
@@ -347,29 +351,42 @@ void cleanupUnusedImages() {
     if (!root)
         return;
 
-    File file = root.openNextFile();
+    // Collect first, delete after: removing files while iterating a LittleFS directory
+    // can make openNextFile() skip entries.
+    std::vector<String> doomed;
 
+    File file = root.openNextFile();
     while (file) {
         String name = file.name();
         file.close();
 
-        if (name.startsWith("/i") && name.endsWith(".bin")) {
-            String hex = name.substring(2, name.length() - 4);
-            uint32_t id = strtoul(hex.c_str(), nullptr, 16);
+        // Arduino-ESP32 returns the bare filename ("iXXXXXXXX.bin"), older cores a leading '/'.
+        if (name.startsWith("/"))
+            name = name.substring(1);
+
+        if (name.length() == 13 && name.startsWith("i") && name.endsWith(".bin")) {
+            uint32_t id = strtoul(name.substring(1, 9).c_str(), nullptr, 16);
             if (!imageIsReferenced(id))
-                LittleFS.remove(name);
+                doomed.push_back("/" + name);
+        } else if (name.startsWith("i") && name.endsWith(".tmp")) {
+            doomed.push_back("/" + name);   // leftover from an interrupted transfer
         }
 
         file = root.openNextFile();
     }
 
     root.close();
+
+    for (const String& path : doomed) {
+        Serial.printf("cleanup: removing %s\n", path.c_str());
+        LittleFS.remove(path);
+    }
 }
 
 // ============================================================
 // Display pipeline
 //
-// The ESP32 renders the whole UI with LVGL into a 1-bit 640x480 framebuffer (black/white,
+// The ESP32 renders the whole UI with LVGL into a 2-bit (4 gray levels) 640x480 framebuffer
 // see ollo_frame.h) and streams it to the RP2040, which only shows it.
 // ============================================================
 
@@ -379,9 +396,9 @@ void cleanupUnusedImages() {
 /* ---- UI layout (tune these if the glasses crop the edges of the picture) ---- */
 // (values were tuned for 320x240; UI_SCALE doubles them for the 640x480 screen)
 #define UI_SCALE (DISPLAY_W / 320)
-#define FONT_SMALL  (&lv_font_montserrat_28)
-#define FONT_MEDIUM (&lv_font_montserrat_32)
-#define FONT_LARGE  (&lv_font_montserrat_40)
+#define FONT_SMALL  (&ollo_font_28)
+#define FONT_MEDIUM (&ollo_font_32)
+#define FONT_LARGE  (&ollo_font_40)
 static const int SAFE_X         = 14 * UI_SCALE;   // left/right margin in pixels
 static const int SAFE_TOP       = 10 * UI_SCALE;   // top margin
 static const int SAFE_BOTTOM    = 10 * UI_SCALE;   // bottom margin
@@ -394,11 +411,11 @@ static const int IMAGE_FOOTER_H = 52 * UI_SCALE;
 #define LV_BUF_LINES 20
 alignas(4) static uint8_t lvDrawBuf[DISPLAY_W * LV_BUF_LINES * 2];   // RGB565
 
-static uint8_t* frameBuf = nullptr;      // packed 1-bit pixels, OLLO_ROW_BYTES per row
+static uint8_t* frameBuf = nullptr;      // packed 2-bit gray pixels, OLLO_ROW_BYTES per row
 static lv_display_t* lvDisp = nullptr;
 static lv_obj_t* uiRoot = nullptr;
 
-/* LVGL hands us finished RGB565 strips; threshold them to black/white. */
+/* LVGL hands us finished RGB565 strips; quantize them to the 4 gray levels. */
 static void lvFlush(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
     const int w = area->x2 - area->x1 + 1;
     const uint32_t stride = lv_draw_buf_width_to_stride(w, LV_COLOR_FORMAT_RGB565);
@@ -409,7 +426,7 @@ static void lvFlush(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) 
             for (int x = 0; x < w; x++) {
                 const int fx = area->x1 + x;
                 if (fx >= 0 && fx < DISPLAY_W)
-                    olloPutPixel(frameBuf, fx, y, olloRgb565ToGray(src[x]) >= 128);
+                    olloPutLevel(frameBuf, fx, y, olloGrayToLevel(olloRgb565ToGray(src[x])));
             }
         }
     }
@@ -565,32 +582,32 @@ static bool openImage(uint32_t id, File& f, ImageInfo& info) {
     const uint16_t w = u16le(wh);
     const uint16_t h = u16le(wh + 2);
     const uint32_t monoLen = ((uint32_t)(w + 7) / 8) * h;
+    const uint32_t grayLen = ((uint32_t)(w + 3) / 4) * h;
     const uint32_t colorLen = (uint32_t)w * h * 2UL;
     const uint32_t remaining = fileSize - 4;
+    const bool sizeOk = w > 0 && h > 0 && w <= MAX_IMG_W && h <= MAX_IMG_H;
+    const bool colorSizeOk = w > 0 && h > 0 && w <= MAX_COLOR_IMG_W && h <= MAX_COLOR_IMG_H;
+
+    // Newer files store a format byte right after width/height; peek at it to disambiguate.
+    uint8_t stored = 0xFF;
+    if (remaining > 0 && f.read(&stored, 1) != 1)
+        stored = 0xFF;
 
     uint8_t format;
-    bool hasFormatHeader;
+    bool hasFormatHeader = true;
 
-    if (remaining == colorLen + 1 && w > 0 && h > 0 && w <= MAX_COLOR_IMG_W && h <= MAX_COLOR_IMG_H) {
+    if (colorSizeOk && remaining == colorLen + 1 && stored == IMAGE_FORMAT_RGB565) {
         format = IMAGE_FORMAT_RGB565;
-        hasFormatHeader = true;
-    } else if (remaining == monoLen + 1 && w > 0 && h > 0 && w <= MAX_IMG_W && h <= MAX_IMG_H) {
+    } else if (sizeOk && remaining == grayLen + 1 && stored == IMAGE_FORMAT_GRAY2) {
+        format = IMAGE_FORMAT_GRAY2;
+    } else if (sizeOk && remaining == monoLen + 1 && stored == IMAGE_FORMAT_MONO) {
         format = IMAGE_FORMAT_MONO;
-        hasFormatHeader = true;
-    } else if (remaining == monoLen && w > 0 && h > 0 && w <= MAX_IMG_W && h <= MAX_IMG_H) {
+    } else if (sizeOk && remaining == monoLen) {
         format = IMAGE_FORMAT_MONO;      // old mono files without a format byte
         hasFormatHeader = false;
     } else {
         f.close();
         return false;
-    }
-
-    if (hasFormatHeader) {
-        uint8_t stored = 0;
-        if (f.read(&stored, 1) != 1 || stored != format) {
-            f.close();
-            return false;
-        }
     }
 
     info.w = w;
@@ -605,6 +622,7 @@ static void blitImage(File& f, const ImageInfo& info) {
     const int w = info.w;
     const int h = info.h;
     const bool mono = info.format == IMAGE_FORMAT_MONO;
+    const bool gray2 = info.format == IMAGE_FORMAT_GRAY2;
 
     /*
      * Images now use the entire physical display.
@@ -623,7 +641,9 @@ static void blitImage(File& f, const ImageInfo& info) {
     const int y0 = (DISPLAY_H - targetH) / 2;
 
     static uint8_t rowBuf[MAX_COLOR_IMG_W * 2];   // largest row: 320 RGB565 px = 640 B (mono max 80 B)
-    const uint32_t rowBytes = mono ? (uint32_t)((w + 7) / 8) : (uint32_t)w * 2UL;
+    const uint32_t rowBytes = mono ? (uint32_t)((w + 7) / 8)
+                            : gray2 ? (uint32_t)((w + 3) / 4)
+                                    : (uint32_t)w * 2UL;
     int lastSy = -1;
 
     for (int dy = 0; dy < targetH; dy++) {
@@ -644,6 +664,10 @@ static void blitImage(File& f, const ImageInfo& info) {
             if (fx < 0 || fx >= DISPLAY_W)
                 continue;
             const int sx = min(w - 1, (dx * w) / targetW);
+            if (gray2) {
+                olloPutLevel(frameBuf, fx, fy, (rowBuf[sx >> 2] >> ((sx & 3) * 2)) & 3);
+                continue;
+            }
             bool white;
             if (mono) {
                 white = (rowBuf[sx >> 3] & (0x80 >> (sx & 7))) != 0;
@@ -952,6 +976,11 @@ void beginImage(const uint8_t* p, size_t len) {
     if (format == IMAGE_FORMAT_MONO) {
         expected = ((uint32_t)(w + 7) / 8) * h;
         maxBytes = MAX_MONO_IMAGE_BYTES;
+        if (w == 0 || h == 0 || w > MAX_IMG_W || h > MAX_IMG_H)
+            expected = 0;
+    } else if (format == IMAGE_FORMAT_GRAY2) {
+        expected = ((uint32_t)(w + 3) / 4) * h;
+        maxBytes = MAX_GRAY2_IMAGE_BYTES;
         if (w == 0 || h == 0 || w > MAX_IMG_W || h > MAX_IMG_H)
             expected = 0;
     } else if (format == IMAGE_FORMAT_RGB565) {
